@@ -1,0 +1,362 @@
+package wrapper
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/franela/goblin"
+	"github.com/go-chi/chi/v5"
+	"github.com/schmurfy/chipi/response"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type someData struct {
+	N   uint
+	Str string
+}
+
+type sharedDecoder struct{}
+
+func (r *sharedDecoder) DecodeBody(body io.ReadCloser, target interface{}, obj interface{}) error {
+	data, ok := target.(*someData)
+	if !ok {
+		return fmt.Errorf("invalid type: %T", target)
+	}
+	data.Str = "some great string !"
+
+	return nil
+}
+
+type createTestUser struct {
+	sharedDecoder
+	response.ErrorEncoder
+
+	Path struct{}
+	Body *someData
+}
+
+func (r *createTestUser) Handle(ctx context.Context, w http.ResponseWriter) error {
+	encoder := json.NewEncoder(w)
+	return encoder.Encode(r.Body)
+}
+
+func TestWrapper(t *testing.T) {
+	g := goblin.Goblin(t)
+
+	g.Describe("Wrapper", func() {
+		g.Describe("setFieldValue", func() {
+			type loc struct {
+				Type string
+			}
+
+			type st struct {
+				Int    int
+				IntPtr *int
+
+				Int8    int8
+				Int8Ptr *int8
+
+				Int16 int16
+				Int32 int32
+				Int64 int64
+
+				Uint   uint
+				Uint32 uint64
+				Uint64 uint64
+
+				Float32 float32
+				Float64 float64
+
+				ArrString []string
+				ArrUint   []uint
+
+				Str    string
+				StrPtr *string
+
+				Bool    bool
+				BoolPtr *bool
+
+				Time    time.Time
+				TimePtr *time.Time
+
+				Loc    loc
+				LocPtr *loc
+			}
+			ctx := context.Background()
+
+			tests := []struct {
+				Field    string
+				Value    string
+				Expected interface{}
+			}{
+				{"Int", "34", 34},
+				{"IntPtr", "23", 23},
+
+				{"Int8", "127", int8(127)},
+				{"Int8Ptr", "-127", int8(-127)},
+
+				{"Int16", "45", int16(45)},
+				{"Int32", "274", int32(274)},
+				{"Int64", strconv.FormatInt(math.MaxInt64, 10), int64(math.MaxInt64)},
+
+				{"Uint", "579", uint(579)},
+				{"Uint32", strconv.FormatUint(math.MaxUint32, 10), uint64(math.MaxUint32)},
+				{"Uint64", strconv.FormatUint(math.MaxUint64, 10), uint64(math.MaxUint64)},
+
+				{"ArrString", "a,b,toto", []string{"a", "b", "toto"}},
+				{"ArrString", "[a,b,toto]", []string{"a", "b", "toto"}},
+				{"ArrString", `["a","b","toto"]`, []string{"a", "b", "toto"}},
+				{"ArrUint", "3,567,900", []uint{3, 567, 900}},
+				{"ArrUint", "3,  567,  900", []uint{3, 567, 900}},
+
+				{"Float32", "3.1415927", float32(3.1415927)},
+
+				{"Str", "a few words", "a few words"},
+				{"Bool", "true", true},
+
+				{"Time", "2023-10-29T15:30:45Z", time.Date(2023, 10, 29, 15, 30, 45, 0, time.UTC)},
+				{"Time", "2023-12-25T08:15:30+02:00", time.Date(2023, 12, 25, 8, 15, 30, 0, time.FixedZone("", 2*3600))},
+				{"TimePtr", "2024-01-01T00:00:00Z", time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)},
+
+				{"LocPtr", `{"Type": "toto"}`, loc{Type: "toto"}},
+				{"Loc", `{"Type": "titi"}`, loc{Type: "titi"}},
+			}
+
+			for _, tt := range tests {
+				// bind to local value
+				tt := tt
+				g.It(fmt.Sprintf("should set direct field value (%s)", tt.Field), func() {
+					st := st{}
+					vv := reflect.ValueOf(&st).Elem().FieldByName(tt.Field)
+
+					err := setFValue(ctx, "unused", vv, tt.Value)
+					require.NoError(g, err)
+
+					if strings.HasSuffix(tt.Field, "Ptr") {
+						require.NotNil(g, vv.Interface())
+						assert.Equal(g, tt.Expected, vv.Elem().Interface())
+					} else {
+						assert.Equal(g, tt.Expected, vv.Interface())
+					}
+				})
+			}
+
+		})
+
+		g.Describe("time.Time parsing errors", func() {
+			g.It("should handle invalid time format", func() {
+				ctx := context.Background()
+				st := struct {
+					Time time.Time
+				}{}
+				vv := reflect.ValueOf(&st).Elem().FieldByName("Time")
+
+				err := setFValue(ctx, "unused", vv, "invalid-time-format")
+				require.Error(g, err)
+			})
+
+			g.It("should handle invalid time format for pointer", func() {
+				ctx := context.Background()
+				st := struct {
+					TimePtr *time.Time
+				}{}
+				vv := reflect.ValueOf(&st).Elem().FieldByName("TimePtr")
+
+				err := setFValue(ctx, "unused", vv, "2023-13-45T25:70:80Z")
+				require.Error(g, err)
+			})
+		})
+
+		g.Describe("incoming request", func() {
+			type testRequest struct {
+				Path struct {
+					Id      int
+					AString string
+					B       bool
+				}
+				Query struct {
+					Count                     *int
+					FieldUnspecifiedInRequest *int
+					Unset                     *string
+					PascalCaseNoJsonTagField  *string
+					PascalCaseJsonTagField    *string `json:"overrided_name"`
+					Slice                     []string
+					Tag                       string `json:"tag,omitempty"`
+					CreatedAt                 *time.Time
+					UpdatedAt                 time.Time
+				}
+
+				Header struct {
+					XZoovClientId string `name:"X-Zoov-ClientId"`
+				}
+
+				PrivateString string
+			}
+
+			var req *http.Request
+			var rctx *chi.Context
+			var reqObject *testRequest
+
+			var slice []string
+
+			g.BeforeEach(func() {
+				var ok bool
+
+				req = httptest.NewRequest("GET", "/user", nil)
+				rctx = chi.NewRouteContext()
+				req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+				req.Header.Set("X-Zoov-ClientId", "azerty")
+
+				// path
+				rctx.URLParams.Add("Id", "42")
+				rctx.URLParams.Add("AString", "toto")
+				rctx.URLParams.Add("B", "true")
+
+				// query
+				query := req.URL.Query()
+				query.Set("count", "2")
+				query.Set("pascal_case_no_json_tag_field", "some_value_1")
+				query.Set("overrided_name", "some_value_2")
+				query.Set("tag", "some_tag_value")
+				query.Set("created_at", "2023-10-29T15:30:45Z")
+				query.Set("updated_at", "2024-01-01T12:00:00+01:00")
+				slice = []string{"name", "duration", "label"}
+				query.Set("slice", strings.Join(slice, ","))
+
+				req.URL.RawQuery = query.Encode()
+
+				m := &testRequest{
+					PrivateString: "some private string",
+				}
+
+				parsingErrors := map[string]string{}
+				vv, hasResponse, err := createFilledRequestObject(req, m, parsingErrors)
+				require.NoError(g, err)
+
+				require.IsType(g, &testRequest{}, vv.Interface())
+
+				assert.False(g, hasResponse.IsValid())
+
+				reqObject, ok = vv.Interface().(*testRequest)
+				require.True(g, ok)
+
+			})
+
+			g.It("should get param from header", func() {
+				assert.Equal(g, "azerty", reqObject.Header.XZoovClientId)
+			})
+
+			g.It("should fill wrapper with path variables", func() {
+				assert.Equal(g, 42, reqObject.Path.Id)
+				assert.Equal(g, "toto", reqObject.Path.AString)
+				assert.Equal(g, true, reqObject.Path.B)
+			})
+
+			g.It("should fill wrapper with query variables", func() {
+				require.NotNil(g, reqObject.Query.Count)
+				assert.Equal(g, 2, *reqObject.Query.Count)
+			})
+
+			g.It("should include private data", func() {
+				assert.Equal(g, "some private string", reqObject.PrivateString)
+			})
+
+			g.It("should parse query param in json snake case to Query struct", func() {
+				require.NotNil(g, reqObject.Query.PascalCaseNoJsonTagField)
+				assert.Equal(g, "some_value_1", *reqObject.Query.PascalCaseNoJsonTagField)
+			})
+
+			g.It("should parse query param in json snake case to Query struct using tag", func() {
+				require.NotNil(g, reqObject.Query.PascalCaseJsonTagField)
+				assert.Equal(g, "some_value_2", *reqObject.Query.PascalCaseJsonTagField)
+			})
+
+			g.It("should parse tag field with multiple json tags", func() {
+				require.Equal(g, "some_tag_value", reqObject.Query.Tag)
+			})
+
+			g.It("should parse slice field", func() {
+				require.Equal(g, slice, reqObject.Query.Slice)
+			})
+
+			g.It("should parse unspecified field to zero value", func() {
+				require.Nil(g, reqObject.Query.FieldUnspecifiedInRequest)
+			})
+
+			g.It("should parse time.Time pointer field from query parameter", func() {
+				require.NotNil(g, reqObject.Query.CreatedAt)
+				expected := time.Date(2023, 10, 29, 15, 30, 45, 0, time.UTC)
+				assert.True(g, expected.Equal(*reqObject.Query.CreatedAt))
+			})
+
+			g.It("should parse time.Time field from query parameter with timezone", func() {
+				expected := time.Date(2024, 1, 1, 12, 0, 0, 0, time.FixedZone("", 3600))
+				assert.True(g, expected.Equal(reqObject.Query.UpdatedAt))
+			})
+
+		})
+
+		g.Describe("custom body decoder", func() {
+			g.It("should be called", func() {
+				rctx := chi.NewRouteContext()
+				ctx := context.WithValue(context.Background(), chi.RouteCtxKey, rctx)
+
+				r := httptest.NewRequest("POST", "/", nil).WithContext(ctx)
+
+				w := httptest.NewRecorder()
+				writtenbody := bytes.NewBufferString("")
+				w.Body = writtenbody
+
+				handler := WrapRequest(&createTestUser{})
+
+				handler(w, r)
+
+				assert.JSONEq(g, `{"N": 0, "Str": "some great string !"}`, writtenbody.String())
+			})
+		})
+	})
+}
+
+func BenchmarkDecoding(b *testing.B) {
+	b.Run("int32", func(b *testing.B) {
+		var n int32 = 42
+
+		b.Run("direct", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				n, err := strconv.ParseInt("42", 10, 32)
+				if err != nil {
+					b.Fatalf("err: %s", err.Error())
+				}
+
+				if n != 42 {
+					b.Fatalf("wrong value: %d", n)
+				}
+			}
+		})
+
+		b.Run("reflect", func(b *testing.B) {
+			typ := reflect.TypeOf(n)
+			for i := 0; i < b.N; i++ {
+				_, err := convertValue(typ, "42")
+				if err != nil {
+					b.Fatalf("err: %s", err.Error())
+				}
+			}
+		})
+
+	})
+
+}
